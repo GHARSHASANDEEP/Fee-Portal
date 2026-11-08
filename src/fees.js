@@ -18,6 +18,8 @@ function ledger(instalments, payments, today) {
 
 /** Reminder offsets (days relative to due date). Only while a balance remains: this is how reminders stop on payment. */
 const OFFSETS = [-3, 0, 3, 7, 15];
+/** Published refund policy: single source for the calculator and the public /policy page. */
+const POLICY = { adminFeePct: 5, adminFeeCapRs: 5000, payWithinDays: 10, gstPct: 18, sac: '999293' };
 function remindersDue(inst, today) {
   if (inst.balance <= 0) return [];
   const off = days(inst.due, today);
@@ -34,14 +36,14 @@ function refund({ totalFee, paid, startDate, endDate, leaveDate }) {
   if (total <= 0) throw new Error('invalid course dates');
   const elapsed = Math.min(Math.max(days(startDate, leaveDate), 0), total);
   const consumed = Math.round((totalFee * elapsed) / total);
-  const adminFee = Math.min(Math.round(totalFee * 0.05), rs(5000));
+  const adminFee = Math.min(Math.round((totalFee * POLICY.adminFeePct) / 100), rs(POLICY.adminFeeCapRs));
   const amount = Math.max(0, Math.min(paid, paid - consumed - adminFee));
-  const payBy = new Date(d(leaveDate) + 10 * DAY).toISOString().slice(0, 10);
+  const payBy = new Date(d(leaveDate) + POLICY.payWithinDays * DAY).toISOString().slice(0, 10);
   return { elapsedDays: elapsed, totalDays: total, consumed, adminFee, paid, amount, payBy };
 }
 
 /** GST inclusive in fee (ASSUMPTION: 18%). */
-function gstSplit(gross, rate = 18) {
+function gstSplit(gross, rate = POLICY.gstPct) {
   const base = Math.round((gross * 100) / (100 + rate));
   return { base, gst: gross - base };
 }
@@ -60,4 +62,4 @@ function dropoutRisk({ overdueInstalments, daysOverdueMax, attendance, tests }) 
   if (tests.length >= 3 && tests[tests.length - 1] < tests[0] * 0.8) { s += 25; reasons.push('test scores down over 20%'); }
   return { score: Math.min(100, s), flag: s >= 50, reasons };
 }
-module.exports = { ledger, remindersDue, refund, gstSplit, dropoutRisk, days, rs, OFFSETS };
+module.exports = { ledger, remindersDue, refund, gstSplit, dropoutRisk, days, rs, OFFSETS, POLICY };

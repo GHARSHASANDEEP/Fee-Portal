@@ -1,7 +1,7 @@
 const http = require('node:http'), fs = require('node:fs'), path = require('node:path'), crypto = require('node:crypto');
-const { db, seed, verify, today, studentLedger, runAutomation } = require('./db');
+const { db, seed, verify, today, studentLedger, runAutomation, SECRET, linkToken, hasConsent } = require('./db');
+const { parseMetrics } = require('./csv');
 const f = require('./fees');
-const SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex'); // random per boot if unset
 const DEMO_OTP = process.env.DEMO_OTP || '123456'; // SMS is mocked; OTP is fixed in demo mode
 const WEBHOOK = process.env.WEBHOOK_SECRET || '';
 const PUB = path.join(__dirname, '..', 'public');
@@ -20,7 +20,7 @@ function owns(user, studentId) {
   if (user.role === 'parent' && s.parent_phone !== user.phone) throw new HttpError(403, 'Not allowed');
   return s;
 }
-const view = (s) => { const L = studentLedger(s.id); return { id: s.id, code: s.code, name: s.name, batch: s.batch, centre: s.centre, status: s.status, ...L, att: m(s.id, 'att'), scores: m(s.id, 'score'), nextDue: L.instalments.find((i) => i.balance > 0) || null }; };
+const view = (s) => { const L = studentLedger(s.id); L.instalments.forEach((i) => { if (i.balance > 0) i.link = '/pay/' + linkToken(i.id); }); return { id: s.id, code: s.code, name: s.name, batch: s.batch, centre: s.centre, status: s.status, plan: s.plan_name, gross: s.fee_total, discount: s.discount, discountReason: s.discount_reason, net: s.fee_total - s.discount, consented: hasConsent(s.id), ...L, att: m(s.id, 'att'), scores: m(s.id, 'score'), nextDue: L.instalments.find((i) => i.balance > 0) || null }; };
 const m = (id, k) => db.prepare('SELECT val FROM metrics WHERE student_id=? AND kind=? ORDER BY idx').all(id, k).map((x) => x.val);
 
 const routes = {
@@ -36,7 +36,22 @@ const routes = {
     if (!u || !verify(String(body.password || ''), u.pass_hash)) throw new HttpError(401, 'Wrong email or password');
     return { token: sign({ role: u.role, uid: u.id }), role: u.role, name: u.name };
   },
-  'GET /api/me/students': ({ user }) => { need(user, 'parent'); return db.prepare('SELECT * FROM students WHERE parent_phone=?').all(user.phone).map(view); },
+  'GET /api/me/students': ({ user }) => { need(user, 'parent'); return db.prepare('SELECT * FROM students WHERE parent_phone=?').all(user.phone).map((s) => (hasConsent(s.id) ? view(s) : { id: s.id, name: s.name, batch: s.batch, needsConsent: true })); },
+  // DPDP: verifiable parental consent = guardian confirmed by OTP to the phone on file, plus explicit agreement. Withdrawable.
+  'POST /api/consent': ({ user, body }) => { need(user, 'parent'); const s = owns(user, Number(body.studentId)); const name = String(body.guardianName || '').trim(), rel = String(body.relation || '');
+    if (name.length < 2 || name.length > 80) throw bad('Enter the guardian name'); if (!['Mother', 'Father', 'Guardian'].includes(rel)) throw bad('Choose a relation'); if (body.agree !== true) throw bad('Consent is required to continue');
+    db.prepare('INSERT INTO consents(student_id,guardian_name,relation,phone,version,at) VALUES(?,?,?,?,?,?)').run(s.id, name, rel, user.phone, 'v1', today()); db.prepare('UPDATE students SET consent_at=? WHERE id=?').run(today(), s.id); return { ok: true }; },
+  'POST /api/consent/withdraw': ({ user, body }) => { need(user, 'parent'); const s = owns(user, Number(body.studentId)); db.prepare('UPDATE consents SET withdrawn_at=? WHERE student_id=? AND withdrawn_at IS NULL').run(today(), s.id); return { ok: true }; },
+  'GET /api/policy': () => ({ ...f.POLICY, refundExample: 'Refund = fee paid − (fee × days attended ÷ course days) − admin fee' }),
+  // Per-instalment payment link (public, signed). Pays only the oldest unpaid instalment so allocation stays correct.
+  'GET /api/link/:token': ({ params }) => linkInfo(params.token),
+  'POST /api/link/:token/pay': ({ params, body }) => { const { i, s, blocked } = linkLookup(params.token);
+    if (typeof body.ref !== 'string' || body.ref.length < 8 || body.ref.length > 64) throw bad('Missing payment reference');
+    if (db.prepare('SELECT 1 FROM payments WHERE ref=?').get(body.ref)) return { ok: true, duplicate: true };
+    if (blocked) throw bad(blocked);
+    db.prepare('INSERT INTO payments(student_id,amount,ref,at,source) VALUES(?,?,?,?,?)').run(s.id, i.balance, body.ref, today(), 'payment-link'); return { ok: true, paid: i.balance }; },
+  'GET /api/receipts/:id': ({ user, params }) => { if (!user) throw new HttpError(401, 'Please sign in'); const p = db.prepare('SELECT * FROM payments WHERE id=?').get(Number(params.id)); if (!p) throw new HttpError(404, 'Not found'); const s = owns(user, p.student_id), g = f.gstSplit(p.amount);
+    return { no: `RCPT-${p.at.slice(0, 4)}-${String(p.id).padStart(5, '0')}`, date: p.at, student: s.name, code: s.code, batch: s.batch, amount: p.amount, base: g.base, cgst: Math.floor(g.gst / 2), sgst: g.gst - Math.floor(g.gst / 2), gstPct: f.POLICY.gstPct, sac: f.POLICY.sac, gstin: process.env.RECEIPT_GSTIN || '08AAAAA0000A1Z5 (demo)', institute: 'Shikshan Coaching, Jaipur', ref: p.ref }; },
   // Mock gateway: pays the oldest unpaid instalment. Idempotent on client-supplied ref.
   'POST /api/pay': ({ user, body }) => {
     const s = owns(user, Number(body.studentId)); if (s.status !== 'active') throw bad('Account is closed');
@@ -68,6 +83,18 @@ const routes = {
       unmatched: db.prepare('SELECT * FROM unmatched WHERE resolved=0').all(), reminders: db.prepare('SELECT r.*, s.name FROM reminders r JOIN instalments i ON i.id=r.instalment_id JOIN students s ON s.id=i.student_id ORDER BY r.id DESC LIMIT 15').all() };
   },
   'GET /api/students/:id': ({ user, params }) => { need(user, 'accounts'); return view(owns(user, Number(params.id))); },
+  'POST /api/students/:id/discount': ({ user, params, body }) => { need(user, 'accounts'); const s = owns(user, Number(params.id)); const amt = Number(body.amount), reason = String(body.reason || '').trim();
+    const L = studentLedger(s.id); if (!Number.isInteger(amt) || amt <= 0 || amt > L.balance) throw bad('Discount must be above 0 and not more than the balance'); if (reason.length < 3 || reason.length > 80) throw bad('Give a reason (3-80 characters)');
+    let left = amt; for (const i of [...L.instalments].reverse()) { const cut = Math.min(left, i.balance); if (cut) db.prepare('UPDATE instalments SET amount=amount-? WHERE id=?').run(cut, i.id); left -= cut; }
+    db.prepare('UPDATE students SET discount=discount+?, discount_reason=? WHERE id=?').run(amt, reason, s.id); return { ok: true }; },
+  'POST /api/upload/metrics': ({ user, body }) => { need(user, 'accounts'); const kind = body.kind === 'att' ? 'att' : body.kind === 'score' ? 'score' : null; if (!kind) throw bad('Choose attendance or score');
+    const batch = String(body.batch || ''); if (!db.prepare('SELECT 1 FROM students WHERE batch=?').get(batch)) throw bad('Unknown batch'); const { rows, errors } = parseMetrics(body.csv); let accepted = 0;
+    db.exec('BEGIN'); try { for (const r of rows) { const s = db.prepare('SELECT id,batch FROM students WHERE code=?').get(r.code); if (!s) errors.push({ line: r.line, reason: `Unknown student ${r.code}` }); else if (s.batch !== batch) errors.push({ line: r.line, reason: `${r.code} is not in ${batch}` });
+      else { const n = db.prepare('SELECT COALESCE(MAX(idx),-1)+1 n FROM metrics WHERE student_id=? AND kind=?').get(s.id, kind).n; db.prepare('INSERT INTO metrics VALUES(?,?,?,?)').run(s.id, kind, n, r.value); accepted++; } } db.exec('COMMIT'); } catch (e) { db.exec('ROLLBACK'); throw e; }
+    return { accepted, rejected: errors.sort((a, b) => a.line - b.line) }; },
+  'GET /api/batches': ({ user }) => { need(user, 'accounts'); return db.prepare('SELECT DISTINCT batch FROM students ORDER BY batch').all().map((r) => r.batch); },
+  'GET /api/refunds': ({ user }) => { need(user, 'accounts'); const t = today(); return db.prepare('SELECT r.*, s.name, s.code FROM refunds r JOIN students s ON s.id=r.student_id ORDER BY r.pay_by').all().map((r) => ({ ...r, overdue: r.status === 'pending' && r.pay_by < t })); },
+  'POST /api/refunds/:id/paid': ({ user, params }) => { need(user, 'accounts'); const r = db.prepare('UPDATE refunds SET status=?, paid_at=? WHERE id=? AND status=?').run('paid', today(), Number(params.id), 'pending'); if (!r.changes) throw new HttpError(404, 'Not found'); return { ok: true }; },
   'POST /api/automation/run': ({ user }) => { need(user, 'accounts'); return runAutomation(); },
   'POST /api/tasks/:id': ({ user, params, body }) => { need(user, 'accounts'); if (!['done', 'false_flag'].includes(body.status)) throw bad('Invalid status'); db.prepare('UPDATE tasks SET status=? WHERE id=?').run(body.status, Number(params.id)); return { ok: true }; },
   'POST /api/unmatched/:id/assign': ({ user, params, body }) => {
@@ -82,9 +109,13 @@ const routes = {
 function refundFor(user, body, confirm) {
   need(user, 'accounts'); const s = owns(user, Number(body.studentId)); if (!isDate(body.leaveDate)) throw bad('Enter a valid leaving date');
   if (confirm && s.status !== 'active') throw bad('Already closed');
-  return confirm ? { s, r: f.refund({ totalFee: s.fee_total, paid: studentLedger(s.id).paid, startDate: s.course_start, endDate: s.course_end, leaveDate: body.leaveDate }) }
-    : f.refund({ totalFee: s.fee_total, paid: studentLedger(s.id).paid, startDate: s.course_start, endDate: s.course_end, leaveDate: body.leaveDate });
+  return confirm ? { s, r: f.refund({ totalFee: s.fee_total - s.discount, paid: studentLedger(s.id).paid, startDate: s.course_start, endDate: s.course_end, leaveDate: body.leaveDate }) }
+    : f.refund({ totalFee: s.fee_total - s.discount, paid: studentLedger(s.id).paid, startDate: s.course_start, endDate: s.course_end, leaveDate: body.leaveDate });
 }
+function linkLookup(token) { const [id, mac] = String(token).split('.'); const inst = db.prepare('SELECT * FROM instalments WHERE id=?').get(Number(id)); if (!inst || linkToken(inst.id) !== `${inst.id}.${mac}`) throw new HttpError(404, 'This payment link is not valid');
+  const s = db.prepare('SELECT * FROM students WHERE id=?').get(inst.student_id); const L = studentLedger(s.id), i = L.instalments.find((x) => x.id === inst.id), first = L.instalments.find((x) => x.balance > 0);
+  const blocked = s.status !== 'active' ? 'This account is closed' : i.balance === 0 ? 'This instalment is already paid' : first.id !== i.id ? 'Please pay the earlier instalment first' : null; return { i, s, blocked }; }
+function linkInfo(token) { const { i, s, blocked } = linkLookup(token); return { student: s.name.split(' ')[0], amount: i.balance, due: i.due, daysOverdue: i.daysOverdue, blocked }; }
 function need(user, role) { if (!user) throw new HttpError(401, 'Please sign in'); if (user.role !== role) throw new HttpError(403, 'Not allowed'); }
 const compiled = Object.entries(routes).map(([k, h]) => { const [method, p] = k.split(' '); return { method, re: new RegExp('^' + p.replace(/:(\w+)/g, '(?<$1>[^/]+)') + '$'), h }; });
 

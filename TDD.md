@@ -1,50 +1,83 @@
 # Technical Design Document: Fee Tracking System & Parent Portal
-**Client:** Company A, Jaipur coaching institute (Problem 3)
-**GitHub:** `<ADD YOUR REPO URL HERE>`  **Live app:** `<ADD LIVE URL HERE>`
 
-## 1. What was built (core slice)
-Fee ledger, parent portal (OTP login, dues, pay link, receipts, attendance and scores), reminders that stop on payment, pro-rata refund calculator, accounts dues dashboard (by centre and batch, with ageing and a Tally CSV export), a dropout-risk flag that only creates counsellor tasks, and an unmatched-payments queue. Hindi and English throughout. Roles: **parent** and **accounts executive**.
+**Client:** Company A, Jaipur coaching institute (Problem 3)
+**GitHub:** `<ADD YOUR REPO URL HERE>`
+**Live app:** `<ADD LIVE URL HERE>`
+
+## 1. Scope: every "must have" is built
+| Must have (brief) | Where |
+|---|---|
+| Fee ledger: plan, instalments, discounts, payments, balance, days overdue | Student ledger sheet (staff); `ledger()` in `fees.js`; plan name, gross, discount, net |
+| Parent portal, OTP login: dues, receipts, attendance, test scores | Parent home |
+| Automatic Hindi/English reminders (before, on, after), stopping on payment | `runAutomation()`; offsets −3, 0, +3, +7, +15 |
+| Payment link per instalment (test mode) that marks it paid | Public `/pay/<signed token>` page |
+| Pro-rata refund calculator | Refund tab; `refund()` |
+| Accounts dashboard by centre and batch, ageing, Tally export | Dues tab; `/api/export/tally.csv` |
+| Bulk upload of attendance and test scores per batch | Upload tab; `csv.js` |
+| AI: dropout-risk flag → counsellor task | `dropoutRisk()`; Tasks tab |
+| Unmatched payments queue | webhook → `unmatched` → Tasks tab |
+| Constraints: refund policy published, 10-day refund, GST receipts, DPDP parental consent, Hindi | `/policy` page, refund tracker, receipt view, consent gate, Hindi default |
+
+Roles: **parent** and **accounts executive**.
 
 ## 2. Architecture and why
 | Layer | Choice | Why |
 |---|---|---|
-| Backend | Node 22, built-in `http`, no framework | Zero dependencies: nothing to audit or break, runs anywhere. Trade-off: hand-rolled routing (about 40 lines), acceptable at this size. |
-| Database | SQLite (`node:sqlite`) | Single file, transactional, enough for 2,600 students. Money is stored as integer paise. Migrating to Postgres means changing `db.js` only. |
-| Frontend | Static HTML, CSS and vanilla JS, built with DOM calls (`textContent`, never `innerHTML`) | Small payload for low-end phones on slow networks; no build step; XSS-safe by construction. |
-| Auth | Parent: mobile and OTP. Staff: email and password (scrypt). Signed HMAC session token, 8-hour expiry | Matches the brief (parents use OTP). SMS is mocked, so the demo OTP is configurable. |
+| Backend | Node 22, built-in `http`, no framework | Zero dependencies: nothing to audit; runs anywhere. Trade-off: hand-rolled routing, fine at this size. |
+| Database | SQLite (`node:sqlite`) | Single file, transactional, ample for 2,600 students. Money stored as integer paise. Moving to Postgres only touches `db.js`. |
+| Frontend | Static HTML/CSS/vanilla JS, DOM built with `textContent` (never `innerHTML`) | Light payload for low-end phones on slow networks; no build step; XSS-safe by construction. |
+| Auth | Parent: mobile + OTP. Staff: email + password (scrypt). HMAC-signed session token, 8h expiry | Matches the brief. SMS is mocked, so the OTP is a configurable demo value. |
 
-**Layering:** `src/fees.js` holds pure rules with no I/O (unit-tested). `src/db.js` holds schema, seed and automation. `src/server.js` holds routes, auth and validation. `public/` holds the UI.
+Layering: `src/fees.js` (pure rules, unit-tested) · `src/csv.js` (pure parser) · `src/db.js` (schema, seed, automation) · `src/server.js` (routes, auth, validation) · `public/` (UI).
 
 ## 3. Data model
-`users`(role, email, pass_hash) · `students`(code, batch, centre, parent_phone, lang, fee_total, course dates, consent_at, status) · `instalments`(student, due, amount) · `payments`(student, amount, **unique ref**, source) · `unmatched`(ref, payer, amount) · `reminders`(**unique instalment+offset**) · `tasks`(**unique student**, score, reasons, status) · `metrics`(attendance and test series) · `refunds`.
-Key decision: **balances are never stored.** Payments are allocated to instalments oldest-first at read time, so the ledger cannot drift out of sync and an out-of-order or partial payment is always handled the same way.
+`users` · `students`(batch, centre, parent_phone, lang, fee_total, course dates, plan_name, discount, discount_reason, status) · `instalments` · `payments`(**unique ref**, source) · `unmatched` · `reminders`(**unique instalment+offset**) · `tasks`(**unique student**) · `metrics`(attendance and score series) · `consents`(guardian, relation, phone, version, withdrawn_at) · `refunds`(pay_by, status, paid_at).
+Key decision: **balances are never stored.** Payments are allocated to instalments oldest-first when read, so the ledger cannot drift and partial or out-of-order payments behave the same way every time.
 
 ## 4. Main flows
-1. **Pay:** parent taps Pay, a confirm sheet appears (mock gateway, test mode), and `POST /api/pay` pays the oldest unpaid balance. A client-generated `ref` makes double-taps and retries idempotent (unique constraint).
-2. **Reminders:** the daily job (also a button) checks each unpaid instalment at offsets −3, 0, +3, +7 and +15 days. It inserts into `reminders` with a unique key, so re-running never duplicates. **Stopping on payment** works because the rule only fires when the balance is above 0. There is no state to forget to clear.
-3. **Gateway webhook:** requires `x-webhook-secret`. A payment is applied only if it matches a known student and does not exceed their balance. Anything else goes to the **accounts queue** and nothing is marked paid. Accounts can then assign it manually.
-4. **Refund:** staff pick a student and leaving date, see a full breakup, then confirm. Confirming closes the account, which also stops reminders and the pay button.
-5. **Dashboard:** ageing buckets (0–30, 31–60, 60+ late, not yet due) per centre and batch, a student list sorted by lateness, and a Tally CSV export with a GST split.
+1. **Pay (portal or link):** confirm sheet (mock gateway) → server pays the oldest unpaid instalment's balance. A client `ref` makes retries and double-taps idempotent, including a retry after success.
+2. **Payment link:** each instalment has a signed token (HMAC); a tampered or invalid token returns 404. Paying a *later* instalment while an earlier one is open is refused, which keeps allocation correct. Reminders contain this link.
+3. **Reminders:** a daily job (also a button, safe to re-run) inserts into `reminders` under a unique key. It only fires while a balance remains, which is how it **stops on payment**. Students without active guardian consent get **no** reminders.
+4. **Webhook:** needs `x-webhook-secret`. A payment is applied only if the student matches and it does not exceed the balance; otherwise it goes to the accounts queue and nothing is marked paid. Accounts assign it manually.
+5. **Refund:** pick student and date → full breakup → confirm. Confirming closes the account (stops reminders and Pay) and creates a tracked refund with a pay-by date (leaving date + 10 days); overdue refunds are flagged, and accounts mark them paid.
+6. **Discount:** staff apply an amount with a reason; it reduces the latest unpaid instalments only, never exceeds the balance, and the refund uses the net fee.
+7. **Bulk upload:** staff choose batch and type (attendance or score) and upload `student_id,value`. Valid rows are saved atomically; invalid rows (unknown student, student not in that batch, value outside 0–100, duplicate, bad header) come back with line numbers.
+8. **Receipt:** each payment has a numbered receipt (`RCPT-YYYY-NNNNN`) showing base, CGST 9%, SGST 9%, total, GSTIN and SAC, printable or savable as PDF from the browser.
+9. **Consent (DPDP):** after OTP login the parent must name themselves as guardian and agree before any child data is shown. The record stores the OTP-verified phone and the policy version. Withdrawal is one tap and re-locks the data and stops reminders.
 
-### Refund rule (ASSUMPTION, see §8)
-`consumed = fee × elapsed days ÷ course days` · `admin fee = min(5% of fee, ₹5,000)` · `refund = paid − consumed − admin fee`, clamped to [0, paid] · payable within 10 days of leaving (MoE 2024 guideline). Covered by unit tests, including the clamps.
+### Refund rule (ASSUMPTION, see §8), published at `/policy`
+`consumed = net fee × days attended ÷ course days` · `admin fee = min(5% of net fee, ₹5,000)` · `refund = paid − consumed − admin fee`, clamped to [0, paid] · payable within 10 days. All numbers live in one `POLICY` object, so the calculator and the public page cannot disagree.
 
 ## 5. The AI part: dropout-risk flag
-It is an **explainable weighted score (0–100), not a trained model**. Signals: overdue instalments (up to 40), recent attendance below 70% (20), attendance drop above 10 points (15), and test scores down over 20% (25). A flag at 50 or above creates **one counsellor call task** with the human-readable reasons.
-**When it is wrong or unsure:** it can never message a parent or touch fees. Counsellors mark *Done* or *False flag*, and a task is unique per student so it cannot spam. I chose rules over ML because there is no labelled history, and every flag must be explainable to a counsellor. With real history, the score could be calibrated or replaced by a model, with the same task-only output.
+An **explainable weighted score (0–100), not a trained model**. Signals: overdue instalments (up to 40), recent attendance below 70% (20), attendance drop above 10 points (15), test scores down over 20% (25). A score of 50 or more creates **one counsellor call task** with the reasons in plain language.
+**When it is wrong or unsure:** it can never message a parent or change a fee. Counsellors mark *Done* or *False flag*. Tasks are unique per student, so it cannot spam. Rules were chosen over ML because there is no labelled history and every flag must be explainable. With real history it could be calibrated or replaced with a model that has the same task-only output.
 
 ## 6. UI and design decisions
-- **Parent home:** one hero with amount, due date, status and one pay button, matching the brief's "five seconds" test. Instalments, receipts, attendance and scores sit below the fold.
-- **Staff:** four tabs (Dues, Tasks and queue, Refund, Reminders). Ageing is shown as stacked bars, since a rupee table hides where the money is stuck. Rows open a ledger sheet.
-- **System:** white space, one accent colour (deep green), system fonts with Devanagari fallback, 44px touch targets, visible focus rings, automatic dark mode, language toggle (Hindi default) on every screen. Loading, empty and error states exist on each view. Mobile-first, with sheets that become centred modals on desktop.
+- **Parent home:** one hero with amount, due date, status and one Pay button (the "five seconds" test); instalments, receipts, attendance and scores sit below it.
+- **Pay link:** a single-purpose page (name, amount, due date, Pay), shareable by SMS.
+- **Staff:** five tabs (Dues, Tasks and queue, Refund, Upload, Reminders). Ageing is drawn as stacked bars with a colour legend because a rupee table hides where money is stuck; rows open a ledger sheet with discount and copy-link actions.
+- **System:** white space, one accent colour, system fonts with Devanagari fallback, 44px touch targets, visible focus rings, automatic dark mode, Hindi default with an English toggle everywhere, print styles for receipts, and loading, empty and error states on each view. Mobile-first; sheets become centred modals on desktop.
+- Checked in headless Chromium at 390px width: parent flow, consent gate, pay, receipt, all staff tabs and the policy page ran with no console errors.
 
 ## 7. Security
-No secrets in the repo (`.env.example` lists names only). scrypt password hashing, HMAC-signed tokens, OTP and login throttling, role checks on every route, parent-to-child ownership checks (tested), input validation, 100 KB body limit, security headers including a strict CSP, parameterised SQL, and DOM built with `textContent`.
+No secrets in the repo (`.env.example` lists names only). scrypt password hashing, HMAC-signed session tokens and pay links, OTP and login throttling, role checks on every route, parent-to-child ownership checks (tested), validated inputs (types, ranges, lengths, dates), 100 KB body limit, security headers with a strict CSP, parameterised SQL, DOM built with `textContent`, webhook secret, and no Aadhaar or other unnecessary personal data.
 
 ## 8. Assumptions (labelled)
-A1 Course runs about 12 months, fee ₹1.2 lakh (JEE) or ₹1.6 lakh (NEET), 4 instalments of 25%. A2 Fees include 18% GST. A3 Refund policy as in §4 (the client's written policy replaces it; only `refund()` changes). A4 Parent identity is the phone number on file, one parent to many children. A5 Seed students beyond the 3 sample rows are invented. Sample due dates are made relative to today so the statuses match the brief. A6 `consent_at` is stored, but a real verifiable-parental-consent flow is not built. A7 Reminders are written to a log, not sent.
+- **A1** Course runs 2026-04-01 to 2027-03-31; fee ₹1.2 lakh (JEE) or ₹1.6 lakh (NEET) in 4 instalments.
+- **A2** Fees include 18% GST (CGST 9% + SGST 9%); SAC 999293 and the GSTIN are demo values set by `RECEIPT_GSTIN`.
+- **A3** Refund policy as in §4 (the client's written policy replaces it; only `POLICY` changes).
+- **A4** The parent's identity is the phone number on file; one parent can have several children.
+- **A5** Students beyond the three sample rows are invented. The sample students use the exact sample dates. With `DEMO_TODAY=2026-11-02` the statuses match the brief exactly (Ishita 23 days overdue, Mohit due in 13 days).
+- **A6** "Verifiable" consent is the guardian confirming by OTP to the phone on file plus explicit agreement. A production system may need a stronger method, such as a document check, per legal advice.
+- **A7** SMS, WhatsApp and the payment gateway are mocked. Reminders are written to a log and the payment page is a stand-in.
+- **A8** Receipts are rendered in the browser (print or Save as PDF), not stored as files.
 
-## 9. What I cut, and next steps
-**Cut:** real payment gateway and SMS/WhatsApp, verifiable parental consent (DPDP), bulk CSV upload of attendance and scores (scores are seeded), full GST receipt PDFs, centre-scoped staff roles, instalment plan editing and discounts UI, audit log, and a scheduler (the job is a button and is idempotent, so a cron can call it).
-**Next:** consent capture at onboarding, receipt PDFs, the CSV upload, Postgres, a cron, an audit trail for refunds, and a counsellor role.
-**Known limits:** in-memory throttling resets on restart; the SQLite file needs a persistent disk when deployed; Hindi strings should be reviewed by a native speaker; no visual regression or browser tests.
+## 9. What I cut, known limits and next steps
+**Cut:** a real gateway and SMS provider, a scheduler (the job is idempotent and a cron can call it), centre-scoped staff roles, an audit log, an instalment-plan builder (plans are seeded), server-side PDF receipts, and Excel (.xlsx) upload (CSV only).
+**Known limits:**
+- Login throttling is in memory and resets on restart.
+- SQLite needs a persistent disk when deployed.
+- Hindi strings need review by a native speaker.
+- There are no automated browser tests; the UI was exercised once with a scripted headless browser.
+- Discounts only reduce unpaid instalments.
+**Next:** a real gateway and SMS provider, cron, centre-scoped roles, an audit trail for refunds and discounts, server-side receipt PDFs, a counsellor role and a plan builder.
