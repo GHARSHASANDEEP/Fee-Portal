@@ -13,6 +13,7 @@ To see the sample statuses exactly as in the brief (Ishita 23 days overdue, Mohi
 
 ## How it is deployed
 **Free option used: Hugging Face Spaces (Docker).** The repo has a `Dockerfile` and a `README.md` with the Space settings (`sdk: docker`, `app_port: 7860`). The Space builds the image and runs `node src/server.js` on port 7860. The database is `/tmp/data.db`, so it is **recreated from seed data whenever the Space restarts**. This is fine for a demo, but not for production.
+**Auto-deploy:** `.github/workflows/deploy-space.yml` pushes `main` to the Space on every GitHub push (needs the GitHub secrets `HF_TOKEN` and `HF_USERNAME`).
 Any other Node 22 host also works (Render, Railway, Fly.io): start command `npm start`, health check `/healthz`, and for real use mount a persistent disk and point `DB_PATH` at it.
 
 ## Environment variables (names only)
