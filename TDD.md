@@ -2,7 +2,7 @@
 
 **Client:** Company A, Jaipur coaching institute (Problem 3)
 **GitHub:** `<ADD YOUR REPO URL HERE>`
-**Live app:** `<ADD LIVE URL HERE>`
+**Live app:** Not deployed (optional in the brief). It runs locally with one command, `npm start`; see `deployment.md`. The repo is deploy-ready (Dockerfile and a GitHub Action for a free Hugging Face Space).
 
 ## 1. Scope: every "must have" is built
 | Must have (brief) | Where |
@@ -75,6 +75,7 @@ No secrets in the repo (`.env.example` lists names only). scrypt password hashin
 ## 9. What I cut, known limits and next steps
 **Cut:** a real gateway and SMS provider, a scheduler (the job is idempotent and a cron can call it), centre-scoped staff roles, an audit log, an instalment-plan builder (plans are seeded), server-side PDF receipts, and Excel (.xlsx) upload (CSV only).
 **Known limits:**
+- Not deployed live: the app runs locally and has been tested only locally and in headless Chromium. The Dockerfile and GitHub Action for a Hugging Face Space were written but not run.
 - Login throttling is in memory and resets on restart.
 - SQLite needs a persistent disk when deployed.
 - Hindi strings need review by a native speaker.

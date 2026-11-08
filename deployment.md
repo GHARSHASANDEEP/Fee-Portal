@@ -12,9 +12,9 @@ To see the sample statuses exactly as in the brief (Ishita 23 days overdue, Mohi
 `DEMO_TODAY=2026-11-02 npm start` (Windows PowerShell: `$env:DEMO_TODAY="2026-11-02"; npm start`).
 
 ## How it is deployed
-**Free option used: Hugging Face Spaces (Docker).** The repo has a `Dockerfile` and a `README.md` with the Space settings (`sdk: docker`, `app_port: 7860`). The Space builds the image and runs `node src/server.js` on port 7860. The database is `/tmp/data.db`, so it is **recreated from seed data whenever the Space restarts**. This is fine for a demo, but not for production.
-**Auto-deploy:** `.github/workflows/deploy-space.yml` pushes `main` to the Space on every GitHub push (needs the GitHub secrets `HF_TOKEN` and `HF_USERNAME`).
-Any other Node 22 host also works (Render, Railway, Fly.io): start command `npm start`, health check `/healthz`, and for real use mount a persistent disk and point `DB_PATH` at it.
+**Current state: not deployed live.** The reviewer can run the app locally in one command (see above), and every feature works locally. No hosted database or external service is needed. Payments, SMS and OTP are mocked.
+**Deploy-ready:** the repo includes a `Dockerfile` (port 7860, SQLite at `/tmp/data.db`) and a GitHub Action (`.github/workflows/deploy-space.yml`) that can push `main` to a free Hugging Face Space (Docker SDK) when the GitHub secrets `HF_TOKEN` and `HF_USERNAME` are set. These were written but **not run**. Any Node 22 host also works: start command `npm start`, health check `/healthz`, and for real use a persistent disk with `DB_PATH` pointing to it.
+The database is created and seeded automatically on first start.
 
 ## Environment variables (names only)
 `SESSION_SECRET` (long random value in production) · `DEMO_OTP` · `DEMO_STAFF_PASSWORD` · `WEBHOOK_SECRET` (the webhook is off if unset) · `RECEIPT_GSTIN` · `DEMO_TODAY` (optional, pins "today" for demos) · `DB_PATH` · `PORT`
