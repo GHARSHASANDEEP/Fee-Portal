@@ -12,7 +12,8 @@ To see the sample statuses exactly as in the brief (Ishita 23 days overdue, Mohi
 `DEMO_TODAY=2026-11-02 npm start` (Windows PowerShell: `$env:DEMO_TODAY="2026-11-02"; npm start`).
 
 ## How it is deployed
-Any Node 22 host with a persistent disk (Render, Railway, Fly.io). Build command: none. Start command: `npm start`. Health check: `/healthz`. Mount the disk and point `DB_PATH` at it (for example `/data/data.db`). Without it, SQLite resets on every deploy.
+**Free option used: Hugging Face Spaces (Docker).** The repo has a `Dockerfile` and a `README.md` with the Space settings (`sdk: docker`, `app_port: 7860`). The Space builds the image and runs `node src/server.js` on port 7860. The database is `/tmp/data.db`, so it is **recreated from seed data whenever the Space restarts**. This is fine for a demo, but not for production.
+Any other Node 22 host also works (Render, Railway, Fly.io): start command `npm start`, health check `/healthz`, and for real use mount a persistent disk and point `DB_PATH` at it.
 
 ## Environment variables (names only)
 `SESSION_SECRET` (long random value in production) · `DEMO_OTP` · `DEMO_STAFF_PASSWORD` · `WEBHOOK_SECRET` (the webhook is off if unset) · `RECEIPT_GSTIN` · `DEMO_TODAY` (optional, pins "today" for demos) · `DB_PATH` · `PORT`
